@@ -30,8 +30,7 @@ const LABEL_PROPS = ["children", "label", "title", "text", "name"];
 const REACT_ELEMENT = Symbol.for("react.element");
 const REACT_TRANSITIONAL_ELEMENT = Symbol.for("react.transitional.element");
 
-const counters: Record<string, number> = { jsx: 0, jsxs: 0, createElement: 0, arraysSeen: 0, injected: 0 };
-const hooksInstalled: string[] = [];
+const counters: Record<string, number> = { jsx: 0, jsxs: 0, createElement: 0, arraysSeen: 0, injected: 0, rehooks: 0 };
 const debugEntries: string[] = [];
 const debugSeen = new Set<string>();
 const MAX_ENTRIES = 60;
@@ -157,7 +156,10 @@ export function getDebugReport(): string {
     `Settings: ${JSON.stringify(getCurrent())}`,
     `SP_JSX present: ${!!runtime}${runtime ? ` (keys: ${Object.keys(runtime).join(", ")})` : ""}`,
     `SP_REACT present: ${!!(window as any).SP_REACT}`,
-    `Hooks installed: ${hooksInstalled.join(", ") || "none"}`,
+    `Hooks installed: ${Object.keys(restorers).filter((k) => restorers[k]).join(", ") || "none"}`,
+    `Hooks currently receiving calls: ${JSON.stringify(probeHooks())}`,
+    `SP_JSX/SP_REACT unchanged since install: ${runtime === hookedRuntime && (window as any).SP_REACT === hookedReact}`,
+    `Re-hooks: ${counters.rehooks} (last: ${lastRehook})`,
     `Counters: ${JSON.stringify(counters)}`,
     `Entries recorded: ${debugEntries.length}`,
     "",
@@ -190,6 +192,18 @@ function noteInjection(type: any, props: any) {
 
 /* -------------------------------- Hooking -------------------------------- */
 
+const PROBE_PROP = "data-collections-shortcut-probe";
+const WATCHDOG_INTERVAL_MS = 2000;
+
+let disposed = false;
+let busy = false;
+let hookedRuntime: any = null;
+let hookedReact: any = null;
+let watchdog: ReturnType<typeof setInterval> | null = null;
+let probeSeen: Record<string, boolean> = {};
+let lastRehook = "none";
+const restorers: Record<string, (() => void) | null> = {};
+
 function replaceMethod(target: any, key: string, patched: any, original: any): (() => void) | null {
   try {
     target[key] = patched;
@@ -208,13 +222,17 @@ function replaceMethod(target: any, key: string, patched: any, original: any): (
   };
 }
 
-function hookJsx(runtime: any, key: "jsx" | "jsxs"): (() => void) | null {
+function hookJsx(runtime: any, key: "jsx" | "jsxs") {
   const original = runtime?.[key];
-  if (typeof original !== "function") return null;
+  if (typeof original !== "function") {
+    restorers[key] = null;
+    return;
+  }
 
   const patched = function (this: any, type: any, props: any, ...rest: any[]) {
     counters[key]++;
     if (props) {
+      if (props[PROBE_PROP]) probeSeen[key] = true;
       const settings = getCurrent();
       if (settings.debug) {
         recordLeaf(type, props);
@@ -223,11 +241,18 @@ function hookJsx(runtime: any, key: "jsx" | "jsxs"): (() => void) | null {
           recordArray(type, props.children);
         }
       }
-      if (settings.enabled && isLibraryItem(props) && jsxsOriginal && fragmentType) {
+      // "busy" keeps a second copy of this hook (for example after a re-hook) from injecting twice.
+      if (!disposed && !busy && settings.enabled && isLibraryItem(props) && jsxsOriginal && fragmentType) {
         try {
-          const libraryEl = original.call(this, type, props, ...rest);
-          const collectionsEl = original.call(this, type, collectionsProps(props), INJECTED_KEY);
-          const pair = settings.position === "above" ? [collectionsEl, libraryEl] : [libraryEl, collectionsEl];
+          let pair: any[];
+          busy = true;
+          try {
+            const libraryEl = original.call(this, type, props, ...rest);
+            const collectionsEl = original.call(this, type, collectionsProps(props), INJECTED_KEY);
+            pair = settings.position === "above" ? [collectionsEl, libraryEl] : [libraryEl, collectionsEl];
+          } finally {
+            busy = false;
+          }
           noteInjection(type, props);
           return jsxsOriginal.call(jsxRuntime, fragmentType, { children: pair }, rest[0]);
         } catch (e) {
@@ -238,16 +263,20 @@ function hookJsx(runtime: any, key: "jsx" | "jsxs"): (() => void) | null {
     return original.call(this, type, props, ...rest);
   };
 
-  return replaceMethod(runtime, key, patched, original);
+  restorers[key] = replaceMethod(runtime, key, patched, original);
 }
 
-function hookCreateElement(react: any): (() => void) | null {
+function hookCreateElement(react: any) {
   const original = react?.createElement;
-  if (typeof original !== "function") return null;
+  if (typeof original !== "function") {
+    restorers.createElement = null;
+    return;
+  }
 
   const patched = function (this: any, type: any, props: any, ...rest: any[]) {
     counters.createElement++;
     if (props) {
+      if (props[PROBE_PROP]) probeSeen.createElement = true;
       const settings = getCurrent();
       if (settings.debug) {
         recordLeaf(type, props);
@@ -256,11 +285,17 @@ function hookCreateElement(react: any): (() => void) | null {
           recordArray(type, props.children);
         }
       }
-      if (settings.enabled && isLibraryItem(props) && fragmentType) {
+      if (!disposed && !busy && settings.enabled && isLibraryItem(props) && fragmentType) {
         try {
-          const libraryEl = original.call(this, type, props, ...rest);
-          const collectionsEl = original.call(this, type, { ...collectionsProps(props), key: INJECTED_KEY }, ...rest);
-          const pair = settings.position === "above" ? [collectionsEl, libraryEl] : [libraryEl, collectionsEl];
+          let pair: any[];
+          busy = true;
+          try {
+            const libraryEl = original.call(this, type, props, ...rest);
+            const collectionsEl = original.call(this, type, { ...collectionsProps(props), key: INJECTED_KEY }, ...rest);
+            pair = settings.position === "above" ? [collectionsEl, libraryEl] : [libraryEl, collectionsEl];
+          } finally {
+            busy = false;
+          }
           noteInjection(type, props);
           return original.call(this, fragmentType, props.key != null ? { key: props.key } : null, ...pair);
         } catch (e) {
@@ -271,41 +306,97 @@ function hookCreateElement(react: any): (() => void) | null {
     return original.call(this, type, props, ...rest);
   };
 
-  return replaceMethod(react, "createElement", patched, original);
+  restorers.createElement = replaceMethod(react, "createElement", patched, original);
+}
+
+function installHooks(runtime: any, react: any) {
+  hookedRuntime = runtime ?? null;
+  hookedReact = react ?? null;
+  jsxRuntime = runtime ?? null;
+  jsxsOriginal = runtime?.jsxs ?? null; // captured before jsxs is wrapped below
+  fragmentType = runtime?.Fragment ?? react?.Fragment ?? null;
+  if (runtime) {
+    hookJsx(runtime, "jsx");
+    hookJsx(runtime, "jsxs");
+  }
+  hookCreateElement(react);
+}
+
+// Sends a harmless throwaway element through each hook point to check that our wrapper is still in the call chain.
+function probeHooks(): Record<string, boolean> {
+  probeSeen = {};
+  const probeProps = () => ({ [PROBE_PROP]: true });
+  try {
+    hookedRuntime?.jsx?.("div", probeProps());
+  } catch {
+    /* ignore */
+  }
+  try {
+    hookedRuntime?.jsxs?.("div", { ...probeProps(), children: [] });
+  } catch {
+    /* ignore */
+  }
+  try {
+    hookedReact?.createElement?.("div", probeProps());
+  } catch {
+    /* ignore */
+  }
+  return { jsx: !!probeSeen.jsx, jsxs: !!probeSeen.jsxs, createElement: !!probeSeen.createElement };
+}
+
+function noteRehook(reason: string) {
+  counters.rehooks++;
+  lastRehook = `${new Date().toISOString()} ${reason}`;
+  console.warn(TAG, "Re-hooking:", reason);
+}
+
+// Something else (another plugin, or Steam itself) can replace or restore the functions we wrapped,
+// which silently removes the tab. This notices that and puts the hooks back.
+function ensureHooks() {
+  if (disposed) return;
+  const runtime = (window as any).SP_JSX;
+  const react = (window as any).SP_REACT;
+
+  if ((runtime && runtime !== hookedRuntime) || (react && react !== hookedReact)) {
+    noteRehook("SP_JSX or SP_REACT was replaced");
+    installHooks(runtime ?? hookedRuntime, react ?? hookedReact);
+    return;
+  }
+
+  const status = probeHooks();
+  const failed = Object.keys(status).filter((k) => !status[k]);
+  if (!failed.length) return;
+
+  noteRehook(`hooks displaced: ${failed.join(", ")}`);
+  fragmentType = hookedRuntime?.Fragment ?? hookedReact?.Fragment ?? fragmentType;
+  if (failed.indexOf("jsxs") !== -1) jsxsOriginal = hookedRuntime?.jsxs ?? jsxsOriginal;
+  if (failed.indexOf("jsx") !== -1 && hookedRuntime) hookJsx(hookedRuntime, "jsx");
+  if (failed.indexOf("jsxs") !== -1 && hookedRuntime) hookJsx(hookedRuntime, "jsxs");
+  if (failed.indexOf("createElement") !== -1) hookCreateElement(hookedReact);
 }
 
 export function installMenuPatch(): (() => void) | null {
   const runtime = (window as any).SP_JSX;
   const react = (window as any).SP_REACT;
-  const restores: Array<() => void> = [];
 
-  jsxRuntime = runtime ?? null;
-  jsxsOriginal = runtime?.jsxs ?? null;
-  fragmentType = runtime?.Fragment ?? react?.Fragment ?? null;
+  if (!runtime) console.error(TAG, "SP_JSX is not available");
 
-  if (runtime) {
-    for (const key of ["jsx", "jsxs"] as const) {
-      const restore = hookJsx(runtime, key);
-      if (restore) {
-        restores.push(restore);
-        hooksInstalled.push(`SP_JSX.${key}`);
-      }
-    }
-  } else {
-    console.error(TAG, "SP_JSX is not available");
-  }
-
-  const restoreCreate = hookCreateElement(react);
-  if (restoreCreate) {
-    restores.push(restoreCreate);
-    hooksInstalled.push("SP_REACT.createElement");
-  }
+  disposed = false;
+  installHooks(runtime, react);
 
   (window as any).__collectionsShortcutReport = getDebugReport;
 
-  if (!restores.length) {
+  if (!Object.keys(restorers).some((k) => restorers[k])) {
     console.error(TAG, "Could not hook the UI renderer");
     return null;
   }
-  return () => restores.forEach((r) => r());
+
+  watchdog = setInterval(ensureHooks, WATCHDOG_INTERVAL_MS);
+
+  return () => {
+    disposed = true;
+    if (watchdog) clearInterval(watchdog);
+    watchdog = null;
+    Object.keys(restorers).forEach((k) => restorers[k]?.());
+  };
 }
