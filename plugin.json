@@ -1,0 +1,10 @@
+{
+  "name": "Collections Shortcut",
+  "author": "JD",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["customization", "library", "navigation"],
+    "description": "Adds a Collections tab to the Steam Menu."
+  }
+}
